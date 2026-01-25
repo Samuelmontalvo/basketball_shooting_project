@@ -1,0 +1,676 @@
+---
+title: "EDA – Force Plate Shooting Data"
+author: "Samuel Montalvo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+# Set working directory to project root for knitting
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+# Setup and Data Loading
+
+## Load Packages
+
+```{r load-packages}
+library(tidyverse)
+library(janitor)
+library(plotly)
+library(knitr)
+library(here)
+
+# Optional packages
+has_naniar <- suppressWarnings(require(naniar, quietly = TRUE))
+has_skimr <- suppressWarnings(require(skimr, quietly = TRUE))
+has_gt <- suppressWarnings(require(gt, quietly = TRUE))
+```
+
+## Load Data
+
+```{r load-data}
+# File paths using here() for robust path resolution
+primary_file <- here("data", "grf_shooting_clean.csv")
+fallback_file <- here("data", "GRF Shooting SM[40].csv")
+
+# Load data with fallback
+if (file.exists(primary_file)) {
+  df <- read_csv(primary_file, show_col_types = FALSE)
+  cat("Loaded primary file:", primary_file, "\n")
+} else if (file.exists(fallback_file)) {
+  df <- read_csv(fallback_file, show_col_types = FALSE) %>%
+    janitor::clean_names()
+  cat("Loaded fallback file:", fallback_file, "\n")
+  cat("Applied janitor::clean_names()\n")
+} else {
+  stop("ERROR: Neither data file found!\n",
+       "Expected: ", primary_file, " or ", fallback_file)
+}
+
+cat("\nDimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+## Column Names
+
+```{r column-names}
+cat("Column names:\n")
+cat(paste(names(df), collapse = "\n"))
+```
+
+## Identify Key Columns
+
+```{r identify-columns}
+# Helper function to find columns by keyword
+find_col <- function(cols, patterns) {
+for (p in patterns) {
+    matches <- cols[str_detect(tolower(cols), tolower(p))]
+    if (length(matches) > 0) return(matches[1])
+  }
+  return(NA_character_)
+}
+
+# Find player_id
+player_id_col <- find_col(names(df), c("^player_id$", "^player$", "subject", "athlete", "^pid$", "^id$"))
+
+if (is.na(player_id_col)) {
+  stop("ERROR: Could not identify player_id column.\n",
+       "Expected column containing: player, pid, athlete, subject, or id")
+}
+
+# Rename to player_id if needed
+if (player_id_col != "player_id") {
+  df <- df %>% rename(player_id = !!sym(player_id_col))
+}
+df <- df %>% mutate(player_id = as.character(player_id))
+
+# Find shot_type
+shot_type_col <- find_col(names(df), c("^shot_type$", "shot.*type", "type.*2.*3"))
+has_shot_type <- !is.na(shot_type_col)
+
+if (has_shot_type && shot_type_col != "shot_type") {
+  df <- df %>% rename(shot_type = !!sym(shot_type_col))
+}
+if (has_shot_type) {
+  df <- df %>%
+    mutate(shot_type = case_when(
+      shot_type %in% c(2, "2", "2PT", "2pt") ~ "2PT",
+      shot_type %in% c(3, "3", "3PT", "3pt") ~ "3PT",
+      TRUE ~ as.character(shot_type)
+    ))
+}
+
+# Find made/result
+made_col <- find_col(names(df), c("^made$", "miss.*made", "result", "outcome", "make"))
+has_made <- !is.na(made_col)
+
+if (has_made && made_col != "made") {
+  df <- df %>% rename(made = !!sym(made_col))
+}
+if (has_made) {
+  df <- df %>% mutate(made = as.integer(made))
+}
+
+# Report findings
+cat("Column Mapping:\n")
+cat("─────────────────────────────────────\n")
+cat("player_id:", player_id_col, "→ player_id\n")
+cat("shot_type:", ifelse(has_shot_type, shot_type_col, "NOT FOUND"), "\n")
+cat("made:     ", ifelse(has_made, made_col, "NOT FOUND"), "\n")
+```
+
+# Data Integrity Checks
+
+## Missingness by Column
+
+```{r missingness-table}
+missingness_by_col <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  mutate(
+    n_total = nrow(df),
+    pct_missing = round(100 * n_missing / n_total, 2)
+  ) %>%
+  arrange(desc(pct_missing))
+
+kable(missingness_by_col, caption = "Missingness by Column")
+```
+
+```{r missingness-plot}
+p_missing <- missingness_by_col %>%
+  filter(pct_missing > 0 | row_number() <= 10) %>%
+  ggplot(aes(x = reorder(column, pct_missing), y = pct_missing,
+             text = paste0(column, ": ", pct_missing, "%"))) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Missing Data by Column",
+    x = NULL,
+    y = "% Missing"
+  ) +
+  theme_minimal()
+
+ggplotly(p_missing, tooltip = "text")
+```
+
+## Duplicate Rows
+
+```{r duplicates}
+n_duplicates <- sum(duplicated(df))
+cat("Number of fully duplicated rows:", n_duplicates, "\n")
+
+if ("shot_number" %in% names(df) && has_shot_type) {
+  dup_trials <- df %>%
+    group_by(player_id, shot_type, shot_number) %>%
+    filter(n() > 1) %>%
+    nrow()
+  cat("Duplicate (player_id, shot_type, shot_number) combinations:", dup_trials, "\n")
+}
+```
+## Trial Balance
+
+```{r trial-balance}
+trials_per_player <- df %>%
+  count(player_id, name = "n_trials") %>%
+  arrange(player_id)
+
+kable(trials_per_player, caption = "Trials per Player")
+```
+
+```{r trial-balance-shot-type, eval=has_shot_type}
+trials_by_type <- df %>%
+  count(player_id, shot_type) %>%
+  pivot_wider(names_from = shot_type, values_from = n, values_fill = 0) %>%
+  mutate(
+    total = `2PT` + `3PT`,
+    balanced = ifelse(`2PT` == 10 & `3PT` == 10, "✓", "✗")
+  )
+
+kable(trials_by_type, caption = "Trials by Shot Type (Expected: 10/10)")
+
+complete_players <- sum(trials_by_type$balanced == "✓")
+cat("\nPlayers with complete data (10 2PT + 10 3PT):", complete_players, "of", nrow(trials_by_type), "\n")
+```
+
+# Numeric Variable Overview
+
+## Summary Statistics
+
+```{r numeric-summary}
+# Identify numeric columns
+exclude_cols <- c("player_id", "shot_type", "made", "position")
+numeric_cols <- df %>%
+  select(-any_of(exclude_cols)) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+cat("Identified", length(numeric_cols), "numeric columns\n")
+
+# Create summary table
+numeric_summary <- df %>%
+  select(all_of(numeric_cols)) %>%
+  summarise(across(everything(), list(
+    mean = ~ mean(.x, na.rm = TRUE),
+    sd = ~ sd(.x, na.rm = TRUE),
+    median = ~ median(.x, na.rm = TRUE),
+    iqr = ~ IQR(.x, na.rm = TRUE),
+    min = ~ min(.x, na.rm = TRUE),
+    max = ~ max(.x, na.rm = TRUE),
+    p1 = ~ quantile(.x, 0.01, na.rm = TRUE),
+    p99 = ~ quantile(.x, 0.99, na.rm = TRUE),
+    pct_na = ~ round(100 * sum(is.na(.x)) / length(.x), 2)
+  ))) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", "stat"),
+    names_pattern = "(.+)_(.+)$"
+  ) %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  arrange(variable)
+
+kable(numeric_summary, caption = "Numeric Variable Summary Statistics")
+```
+
+# Outlier Screening
+
+## Global Outliers (IQR Rule)
+
+```{r global-outliers}
+global_outliers <- tibble(
+  column = character(),
+  n_outliers = integer(),
+  pct_outliers = numeric()
+)
+
+for (col in numeric_cols) {
+  x <- df[[col]]
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+
+  n_out <- sum(x < lower | x > upper, na.rm = TRUE)
+  pct_out <- round(100 * n_out / sum(!is.na(x)), 2)
+
+  global_outliers <- global_outliers %>%
+    add_row(column = col, n_outliers = n_out, pct_outliers = pct_out)
+}
+```
+
+## Within-Player Outliers (|z| > 3)
+
+```{r within-player-outliers}
+within_player_outliers <- tibble(
+  column = character(),
+  n_outliers = integer()
+)
+
+# Players with >= 5 trials
+valid_players <- df %>%
+  count(player_id) %>%
+  filter(n >= 5) %>%
+  pull(player_id)
+
+df_valid <- df %>% filter(player_id %in% valid_players)
+
+for (col in numeric_cols) {
+  z_scores <- df_valid %>%
+    group_by(player_id) %>%
+    mutate(
+      col_mean = mean(.data[[col]], na.rm = TRUE),
+      col_sd = sd(.data[[col]], na.rm = TRUE),
+      z = ifelse(col_sd > 0, (.data[[col]] - col_mean) / col_sd, 0)
+    ) %>%
+    ungroup() %>%
+    pull(z)
+
+  n_out <- sum(abs(z_scores) > 3, na.rm = TRUE)
+
+  within_player_outliers <- within_player_outliers %>%
+    add_row(column = col, n_outliers = n_out)
+}
+```
+
+## Combined Outlier Summary
+
+```{r outlier-summary}
+outlier_summary <- global_outliers %>%
+  rename(global_outliers = n_outliers, global_pct = pct_outliers) %>%
+  left_join(
+    within_player_outliers %>% rename(within_player_outliers = n_outliers),
+    by = "column"
+  ) %>%
+  arrange(desc(global_outliers + within_player_outliers))
+
+kable(outlier_summary, caption = "Outlier Summary by Column")
+```
+
+# Distributions
+
+## Select Key Variables
+
+```{r select-key-vars}
+key_keywords <- c("force", "power", "jump", "brak", "propul", "duration", "depth")
+
+# Get keyword matches
+keyword_matches <- numeric_cols[str_detect(tolower(numeric_cols),
+                                           paste(key_keywords, collapse = "|"))]
+
+# Get top 10 by variance
+var_ranking <- df %>%
+  select(all_of(numeric_cols)) %>%
+  summarise(across(everything(), ~ var(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "variance") %>%
+  arrange(desc(variance))
+
+top_by_variance <- var_ranking %>% slice_head(n = 10) %>% pull(column)
+
+# Combine
+key_vars <- unique(c(keyword_matches, top_by_variance))
+key_vars <- key_vars[1:min(12, length(key_vars))]
+
+cat("Key variables selected for visualization:\n")
+cat(paste(key_vars, collapse = "\n"))
+```
+
+## Overall Distributions
+
+```{r distributions-overall}
+for (var in key_vars) {
+  p <- df %>%
+    ggplot(aes(x = .data[[var]],
+               text = paste0(var, ": ", round(.data[[var]], 2)))) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30,
+                   fill = "steelblue", alpha = 0.7) +
+    geom_density(color = "darkblue", linewidth = 1) +
+    labs(title = paste("Distribution:", var), x = var, y = "Density") +
+    theme_minimal()
+
+  print(ggplotly(p, tooltip = "text"))
+}
+```
+
+## Distributions by Shot Type {.tabset}
+
+```{r distributions-by-shot, eval=has_shot_type, results='asis'}
+for (var in key_vars) {
+  cat("\n\n### ", var, "\n\n")
+
+  p <- df %>%
+    ggplot(aes(x = shot_type, y = .data[[var]], fill = shot_type,
+               text = paste0("Player: ", player_id, "\n", var, ": ", round(.data[[var]], 2)))) +
+    geom_violin(alpha = 0.5) +
+    geom_boxplot(width = 0.2, alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 0.3, size = 1) +
+    scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
+    labs(title = paste(var, "by Shot Type"), x = "Shot Type", y = var) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  print(ggplotly(p, tooltip = "text"))
+}
+```
+
+# Player-Level Variability
+
+```{r find-jump-col}
+jump_col <- find_col(numeric_cols, c("jump_height", "jump", "height"))
+has_jump <- !is.na(jump_col)
+
+if (has_jump) {
+  cat("Jump height variable identified:", jump_col, "\n")
+} else {
+  cat("No jump height variable found\n")
+}
+```
+
+## Paired Dot Plot: 2PT vs 3PT
+
+```{r paired-dot-plot, eval=has_jump && has_shot_type}
+player_means <- df %>%
+  group_by(player_id, shot_type) %>%
+  summarise(mean_value = mean(.data[[jump_col]], na.rm = TRUE), .groups = "drop")
+
+player_wide <- player_means %>%
+  pivot_wider(names_from = shot_type, values_from = mean_value)
+
+p_paired <- player_wide %>%
+  ggplot(aes(x = `2PT`, y = `3PT`,
+             text = paste0("Player: ", player_id,
+                          "\n2PT: ", round(`2PT`, 2),
+                          "\n3PT: ", round(`3PT`, 2)))) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(size = 4, alpha = 0.7, color = "steelblue") +
+  labs(
+    title = paste("Player Mean", jump_col, ": 2PT vs 3PT"),
+    subtitle = "Points above dashed line = higher 3PT than 2PT",
+    x = "Mean 2PT Jump Height",
+    y = "Mean 3PT Jump Height"
+  ) +
+  theme_minimal() +
+  coord_equal()
+
+ggplotly(p_paired, tooltip = "text")
+```
+
+## Spaghetti Plot
+
+```{r spaghetti-plot, eval=has_jump && has_shot_type}
+p_spaghetti <- player_means %>%
+  ggplot(aes(x = shot_type, y = mean_value, group = player_id, color = player_id,
+             text = paste0("Player: ", player_id,
+                          "\nShot Type: ", shot_type,
+                          "\nMean ", jump_col, ": ", round(mean_value, 2)))) +
+  geom_line(alpha = 0.7, linewidth = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = paste("Player-Level Mean", jump_col, "by Shot Type"),
+    x = "Shot Type",
+    y = paste("Mean", jump_col),
+    color = "Player"
+  ) +
+  theme_minimal()
+
+ggplotly(p_spaghetti, tooltip = "text")
+```
+
+# Correlation Structure
+
+## Correlation Matrix
+
+```{r correlation-matrix}
+cor_matrix <- df %>%
+  select(all_of(numeric_cols)) %>%
+  cor(use = "complete.obs")
+
+# Convert to long format
+cor_long <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation")
+```
+
+## Interactive Correlation Heatmap
+
+```{r correlation-heatmap}
+p_cor <- cor_long %>%
+  ggplot(aes(x = var1, y = var2, fill = correlation,
+             text = paste0(var1, " × ", var2, "\nr = ", round(correlation, 3)))) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b",
+    midpoint = 0, limits = c(-1, 1)
+  ) +
+  labs(title = "Correlation Matrix", x = "", y = "") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7)
+  )
+
+ggplotly(p_cor, tooltip = "text")
+```
+
+## Strong Correlations (|r| > 0.7)
+
+```{r strong-correlations}
+strong_cors <- cor_long %>%
+  filter(var1 < var2) %>%
+  filter(abs(correlation) > 0.7) %>%
+  arrange(desc(abs(correlation))) %>%
+  mutate(correlation = round(correlation, 3))
+
+kable(strong_cors %>% head(20), caption = "Strongest Correlations (|r| > 0.7)")
+```
+
+# Shot Success Analysis {.tabset}
+
+```{r shot-success-check, include=FALSE}
+show_made_section <- has_made
+```
+
+```{r shot-success-overall, eval=show_made_section}
+overall_make_rate <- mean(df$made, na.rm = TRUE)
+cat("Overall make rate:", round(overall_make_rate * 100, 1), "%\n")
+```
+
+## Make Rate by Shot Type
+
+```{r make-rate-shot-type, eval=show_made_section && has_shot_type}
+make_by_type <- df %>%
+  group_by(shot_type) %>%
+  summarise(
+    n = n(),
+    makes = sum(made, na.rm = TRUE),
+    make_rate = round(mean(made, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+kable(make_by_type, caption = "Make Rate by Shot Type")
+
+p_make_type <- make_by_type %>%
+  ggplot(aes(x = shot_type, y = make_rate, fill = shot_type,
+             text = paste0(shot_type, "\nMake Rate: ", make_rate, "%\nn = ", n))) +
+  geom_col(alpha = 0.8) +
+  geom_hline(yintercept = overall_make_rate * 100, linetype = "dashed", color = "red") +
+  scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
+  labs(title = "Make Rate by Shot Type",
+       subtitle = paste("Red line = overall (", round(overall_make_rate * 100, 1), "%)"),
+       x = "Shot Type", y = "Make Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplotly(p_make_type, tooltip = "text")
+```
+
+## Make Rate by Player
+
+```{r make-rate-player, eval=show_made_section}
+make_by_player <- df %>%
+  group_by(player_id) %>%
+  summarise(
+    n = n(),
+    makes = sum(made, na.rm = TRUE),
+    make_rate = round(mean(made, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(make_rate))
+
+kable(make_by_player, caption = "Make Rate by Player (Ranked)")
+
+p_make_player <- make_by_player %>%
+  ggplot(aes(x = reorder(player_id, make_rate), y = make_rate,
+             text = paste0("Player: ", player_id,
+                          "\nMake Rate: ", make_rate, "%",
+                          "\nMakes: ", makes, "/", n))) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_hline(yintercept = overall_make_rate * 100, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(title = "Make Rate by Player",
+       subtitle = paste("Red line = overall (", round(overall_make_rate * 100, 1), "%)"),
+       x = "Player ID", y = "Make Rate (%)") +
+  theme_minimal()
+
+ggplotly(p_make_player, tooltip = "text")
+```
+
+## Jump Height vs Make Probability
+
+```{r jump-vs-make, eval=show_made_section && has_jump}
+p_jump_make <- df %>%
+  ggplot(aes(x = .data[[jump_col]], y = made,
+             text = paste0("Player: ", player_id,
+                          "\n", jump_col, ": ", round(.data[[jump_col]], 2),
+                          "\nMade: ", made))) +
+  geom_jitter(alpha = 0.4, height = 0.1, width = 0, color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "red", fill = "red", alpha = 0.2) +
+  labs(
+    title = paste("Make Probability vs", jump_col, "(Descriptive Only)"),
+    subtitle = "Red line = LOESS smooth",
+    x = jump_col,
+    y = "Made (0/1)"
+  ) +
+  theme_minimal()
+
+ggplotly(p_jump_make, tooltip = "text")
+```
+
+# EDA Takeaways
+
+```{r eda-takeaways, results='asis'}
+cat("## Summary\n\n")
+
+# Completeness
+cat("### Data Completeness\n\n")
+high_missing <- missingness_by_col %>% filter(pct_missing > 5)
+if (nrow(high_missing) > 0) {
+  cat("- **Columns with >5% missing:**", paste(high_missing$column, collapse = ", "), "\n")
+} else {
+  cat("- ✓ No columns with >5% missing data\n")
+}
+
+incomplete <- trials_per_player %>% filter(n_trials != 20)
+if (nrow(incomplete) > 0) {
+  cat("- **Players with incomplete trials:**", paste(incomplete$player_id, collapse = ", "), "\n")
+} else {
+  cat("- ✓ All players have expected 20 trials\n")
+}
+
+# Artifact detection
+cat("\n### Potential Artifact Variables\n\n")
+artifact_flags <- numeric_summary %>%
+  mutate(p99_p1_ratio = ifelse(p1 != 0 & !is.na(p1), p99 / p1, NA)) %>%
+  filter(p99_p1_ratio > 100 | min < 0 | is.na(p99_p1_ratio))
+
+if (nrow(artifact_flags) > 0) {
+  cat("- **Flagged variables:**", paste(artifact_flags$variable, collapse = ", "), "\n")
+  cat("  - (Extreme p99/p1 ratios or negative minimums)\n")
+} else {
+  cat("- ✓ No obvious artifact variables detected\n")
+}
+
+# Stability
+cat("\n### Variable Stability\n\n")
+cv_summary <- numeric_summary %>%
+  mutate(cv = sd / abs(mean)) %>%
+  arrange(cv)
+
+stable_vars <- cv_summary %>% filter(cv < 0.3) %>% pull(variable)
+noisy_vars <- cv_summary %>% filter(cv > 0.5) %>% pull(variable)
+
+cat("- **Most stable (CV < 0.3):**", paste(head(stable_vars, 5), collapse = ", "), "\n")
+cat("- **Most variable (CV > 0.5):**", paste(head(noisy_vars, 5), collapse = ", "), "\n")
+
+# Collinearity
+cat("\n### Collinearity Patterns\n\n")
+if (nrow(strong_cors) > 0) {
+  cat("- Found **", nrow(strong_cors), " variable pairs** with |r| > 0.7\n")
+  cat("- **Top correlations:**\n")
+  top_cors <- strong_cors %>% slice_head(n = 5)
+  for (i in 1:nrow(top_cors)) {
+    cat("  - ", top_cors$var1[i], " ↔ ", top_cors$var2[i],
+        " (r = ", top_cors$correlation[i], ")\n", sep = "")
+  }
+} else {
+  cat("- No variable pairs with |r| > 0.7\n")
+}
+
+# Shot type differences
+if (has_shot_type) {
+  cat("\n### Shot Type Observations\n\n")
+  cat("- Review violin/boxplots for systematic 2PT vs 3PT differences\n")
+  cat("- Jump height is typically higher for 3PT shots (greater distance)\n")
+}
+
+# Make rate
+if (has_made) {
+  cat("\n### Make Rate Observations\n\n")
+  cat("- **Overall make rate:**", round(overall_make_rate * 100, 1), "%\n")
+  cat("- **Player variation:**", round(min(make_by_player$make_rate), 1), "% –",
+      round(max(make_by_player$make_rate), 1), "%\n")
+}
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
