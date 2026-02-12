@@ -48,7 +48,6 @@ library(emmeans)
 
 # Tables and visualization
 library(DT)
-library(plotly)
 library(knitr)
 
 # Set contrasts for proper interpretation
@@ -68,6 +67,21 @@ find_col <- function(cols, patterns, required = FALSE, name = "column") {
     stop(paste("ERROR: Could not find required", name, "column"))
   }
   return(NA_character_)
+}
+
+# Helpers for lme4 convergence diagnostics
+get_lme4_messages <- function(mod) {
+  msgs <- mod@optinfo$conv$lme4$messages
+  if (is.null(msgs)) character(0) else as.character(msgs)
+}
+
+is_lme4_converged <- function(messages) {
+  if (length(messages) == 0) return(TRUE)
+  all(str_detect(messages, "boundary \\(singular\\) fit"))
+}
+
+collapse_messages <- function(messages) {
+  if (length(messages) == 0) NA_character_ else paste(unique(messages), collapse = " | ")
 }
 
 # Function to map all columns
@@ -259,7 +273,7 @@ extract_lmm_results <- function(model_list, outcome_col, data_label) {
       model = "base",
       term = NA,
       estimate = NA,
-      std_error = NA,
+      std.error = NA,
       ci_lower = NA,
       ci_upper = NA,
       p_value = NA,
@@ -269,7 +283,8 @@ extract_lmm_results <- function(model_list, outcome_col, data_label) {
       var_residual = NA,
       n = attr(model_list, "n"),
       singular = NA,
-      converged = FALSE
+      converged = FALSE,
+      convergence_note = "model fit failed"
     ))
   }
 
@@ -301,6 +316,8 @@ extract_lmm_results <- function(model_list, outcome_col, data_label) {
 
     # Check singularity
     is_singular <- isSingular(mod) || isTRUE(attr(mod, "singular"))
+    conv_messages <- get_lme4_messages(mod)
+    did_converge <- is_lme4_converged(conv_messages)
 
     mod_results <- fe %>%
       mutate(
@@ -316,10 +333,12 @@ extract_lmm_results <- function(model_list, outcome_col, data_label) {
         var_residual = var_residual,
         n = attr(model_list, "n"),
         singular = is_singular,
-        converged = TRUE
+        converged = did_converge,
+        convergence_note = collapse_messages(conv_messages)
       ) %>%
       select(outcome, data, model, term, estimate, std.error, ci_lower, ci_upper,
-             p_value, std_beta, icc, var_player, var_residual, n, singular, converged)
+             p_value, std_beta, icc, var_player, var_residual, n, singular, converged,
+             convergence_note)
 
     results <- bind_rows(results, mod_results)
   }
@@ -390,6 +409,13 @@ extract_success_results <- function(model_list, data_label) {
   if (!is.null(model_list$gee)) {
     gee_summary <- summary(model_list$gee)
     gee_coef <- gee_summary$coefficients
+    gee_error_code <- model_list$gee$geese$error
+    gee_converged <- is.null(gee_error_code) || all(gee_error_code == 0)
+    gee_note <- if (gee_converged) {
+      NA_character_
+    } else {
+      paste("geese$error =", paste(gee_error_code, collapse = ","))
+    }
 
     gee_results <- tibble(
       model = "GEE",
@@ -401,7 +427,10 @@ extract_success_results <- function(model_list, data_label) {
       or_lower = exp(gee_coef[, "Estimate"] - 1.96 * gee_coef[, "Std.err"]),
       or_upper = exp(gee_coef[, "Estimate"] + 1.96 * gee_coef[, "Std.err"]),
       p_value = gee_coef[, "Pr(>|W|)"],
-      n = attr(model_list, "n")
+      n = attr(model_list, "n"),
+      converged = gee_converged,
+      singular = NA,
+      convergence_note = gee_note
     )
     results <- bind_rows(results, gee_results)
   }
@@ -409,6 +438,9 @@ extract_success_results <- function(model_list, data_label) {
   # GLMM results
   if (!is.null(model_list$glmm)) {
     glmm_fe <- tidy(model_list$glmm, effects = "fixed", conf.int = TRUE)
+    glmm_messages <- get_lme4_messages(model_list$glmm)
+    glmm_converged <- is_lme4_converged(glmm_messages)
+    glmm_singular <- isSingular(model_list$glmm)
 
     glmm_results <- glmm_fe %>%
       mutate(
@@ -417,9 +449,13 @@ extract_success_results <- function(model_list, data_label) {
         or = exp(estimate),
         or_lower = exp(conf.low),
         or_upper = exp(conf.high),
-        n = attr(model_list, "n")
+        n = attr(model_list, "n"),
+        converged = glmm_converged,
+        singular = glmm_singular,
+        convergence_note = collapse_messages(glmm_messages)
       ) %>%
-      select(model, data, term, estimate, std.error, or, or_lower, or_upper, p.value, n) %>%
+      select(model, data, term, estimate, std.error, or, or_lower, or_upper, p.value, n,
+             converged, singular, convergence_note) %>%
       rename(p_value = p.value, std_error = std.error)
 
     results <- bind_rows(results, glmm_results)
@@ -720,12 +756,11 @@ all_models$qc <- qc_fit$models
 shot_type_effects <- all_lmm_results %>%
   filter(str_detect(term, "shot_type|3PT")) %>%
   filter(model == "base") %>%
-  select(outcome, data, estimate, std.error, ci_lower, ci_upper, p_value, std_beta, icc, n) %>%
-  mutate(across(where(is.numeric), ~ round(.x, 3)))
+  select(outcome, data, estimate, std.error, ci_lower, ci_upper, p_value, std_beta, icc, n)
 
 cat("Shot Type (3PT vs 2PT) Effects - Base Models:\n\n")
 datatable(
-  shot_type_effects,
+  shot_type_effects %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
   caption = "LMM Results: 3PT vs 2PT Effect (Reference = 2PT)",
   options = list(pageLength = 20, scrollX = TRUE)
 ) %>%
@@ -883,6 +918,16 @@ datatable(
   formatSignif(columns = "p_value", digits = 3)
 ```
 
+## Success Model Diagnostics
+
+```{r success-model-diagnostics, eval=has_made}
+success_diagnostics <- all_success_results %>%
+  distinct(model, data, n, converged, singular, convergence_note)
+
+cat("Convergence/Singularity diagnostics for success models:\n")
+print(success_diagnostics)
+```
+
 ## Shot Type OR Comparison
 
 ```{r shot-type-or, eval=has_made}
@@ -988,7 +1033,7 @@ if (nrow(singular_models) > 0) {
 # Convergence issues
 failed_models <- all_lmm_results %>%
   filter(converged == FALSE) %>%
-  distinct(outcome, data, model)
+  distinct(outcome, data, model, convergence_note)
 
 cat("\nFailed to Converge:\n")
 if (nrow(failed_models) > 0) {
@@ -1026,7 +1071,7 @@ for (outcome in primary_outcomes) {
       theme_minimal() +
       theme(legend.position = "none")
 
-    emmeans_plots[[outcome]] <- ggplotly(p)
+    emmeans_plots[[outcome]] <- p
   }
 }
 
@@ -1070,7 +1115,7 @@ if (!is.null(success_models$full$gee)) {
     theme_minimal() +
     theme(legend.position = "none")
 
-  ggplotly(p_pred)
+  print(p_pred)
 }
 ```
 
@@ -1107,7 +1152,7 @@ if (!is.null(success_models$full$gee)) {
     ) +
     theme_minimal()
 
-  ggplotly(p_curve)
+  print(p_curve)
 }
 ```
 

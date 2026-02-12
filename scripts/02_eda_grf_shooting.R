@@ -253,7 +253,7 @@ numeric_summary <- df %>%
   pivot_longer(
     everything(),
     names_to = c("variable", "stat"),
-    names_pattern = "(.+)_(.+)$"
+    names_pattern = "^(.*)_(mean|sd|median|iqr|min|max|p1|p99|pct_missing)$"
   ) %>%
   pivot_wider(names_from = stat, values_from = value) %>%
   mutate(
@@ -374,12 +374,12 @@ cat("GENERATING VISUALIZATIONS\n")
 cat("==============================================================================\n\n")
 
 # Check if figures directory exists
-save_figs <- dir.exists("figures/eda")
-if (save_figs) {
-  cat("Figures will be saved to figures/eda/\n\n")
-} else {
-  cat("figures/eda/ not found - plots will display only (not saved)\n\n")
+fig_dir <- "figures/eda"
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 }
+save_figs <- dir.exists(fig_dir)
+cat("Figures will be saved to", fig_dir, "\n\n")
 
 # --- 6A. Missingness Plot ---
 cat("Creating missingness plot...\n")

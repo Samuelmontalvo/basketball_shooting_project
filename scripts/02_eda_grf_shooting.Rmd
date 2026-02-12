@@ -31,7 +31,6 @@ knitr::opts_knit$set(root.dir = here::here())
 ```{r load-packages}
 library(tidyverse)
 library(janitor)
-library(plotly)
 library(knitr)
 library(here)
 
@@ -153,8 +152,7 @@ kable(missingness_by_col, caption = "Missingness by Column")
 ```{r missingness-plot}
 p_missing <- missingness_by_col %>%
   filter(pct_missing > 0 | row_number() <= 10) %>%
-  ggplot(aes(x = reorder(column, pct_missing), y = pct_missing,
-             text = paste0(column, ": ", pct_missing, "%"))) +
+  ggplot(aes(x = reorder(column, pct_missing), y = pct_missing)) +
   geom_col(fill = "steelblue") +
   coord_flip() +
   labs(
@@ -164,7 +162,7 @@ p_missing <- missingness_by_col %>%
   ) +
   theme_minimal()
 
-ggplotly(p_missing, tooltip = "text")
+print(p_missing)
 ```
 
 ## Duplicate Rows
@@ -237,7 +235,7 @@ numeric_summary <- df %>%
   pivot_longer(
     everything(),
     names_to = c("variable", "stat"),
-    names_pattern = "(.+)_(.+)$"
+    names_pattern = "^(.*)_(mean|sd|median|iqr|min|max|p1|p99|pct_na)$"
   ) %>%
   pivot_wider(names_from = stat, values_from = value) %>%
   mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
@@ -354,15 +352,14 @@ cat(paste(key_vars, collapse = "\n"))
 ```{r distributions-overall}
 for (var in key_vars) {
   p <- df %>%
-    ggplot(aes(x = .data[[var]],
-               text = paste0(var, ": ", round(.data[[var]], 2)))) +
+    ggplot(aes(x = .data[[var]])) +
     geom_histogram(aes(y = after_stat(density)), bins = 30,
                    fill = "steelblue", alpha = 0.7) +
     geom_density(color = "darkblue", linewidth = 1) +
     labs(title = paste("Distribution:", var), x = var, y = "Density") +
     theme_minimal()
 
-  print(ggplotly(p, tooltip = "text"))
+  print(p)
 }
 ```
 
@@ -373,8 +370,7 @@ for (var in key_vars) {
   cat("\n\n### ", var, "\n\n")
 
   p <- df %>%
-    ggplot(aes(x = shot_type, y = .data[[var]], fill = shot_type,
-               text = paste0("Player: ", player_id, "\n", var, ": ", round(.data[[var]], 2)))) +
+    ggplot(aes(x = shot_type, y = .data[[var]], fill = shot_type)) +
     geom_violin(alpha = 0.5) +
     geom_boxplot(width = 0.2, alpha = 0.8, outlier.shape = NA) +
     geom_jitter(width = 0.1, alpha = 0.3, size = 1) +
@@ -383,7 +379,7 @@ for (var in key_vars) {
     theme_minimal() +
     theme(legend.position = "none")
 
-  print(ggplotly(p, tooltip = "text"))
+  print(p)
 }
 ```
 
@@ -411,10 +407,7 @@ player_wide <- player_means %>%
   pivot_wider(names_from = shot_type, values_from = mean_value)
 
 p_paired <- player_wide %>%
-  ggplot(aes(x = `2PT`, y = `3PT`,
-             text = paste0("Player: ", player_id,
-                          "\n2PT: ", round(`2PT`, 2),
-                          "\n3PT: ", round(`3PT`, 2)))) +
+  ggplot(aes(x = `2PT`, y = `3PT`)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
   geom_point(size = 4, alpha = 0.7, color = "steelblue") +
   labs(
@@ -426,17 +419,14 @@ p_paired <- player_wide %>%
   theme_minimal() +
   coord_equal()
 
-ggplotly(p_paired, tooltip = "text")
+print(p_paired)
 ```
 
 ## Spaghetti Plot
 
 ```{r spaghetti-plot, eval=has_jump && has_shot_type}
 p_spaghetti <- player_means %>%
-  ggplot(aes(x = shot_type, y = mean_value, group = player_id, color = player_id,
-             text = paste0("Player: ", player_id,
-                          "\nShot Type: ", shot_type,
-                          "\nMean ", jump_col, ": ", round(mean_value, 2)))) +
+  ggplot(aes(x = shot_type, y = mean_value, group = player_id, color = player_id)) +
   geom_line(alpha = 0.7, linewidth = 1) +
   geom_point(size = 3) +
   labs(
@@ -447,7 +437,7 @@ p_spaghetti <- player_means %>%
   ) +
   theme_minimal()
 
-ggplotly(p_spaghetti, tooltip = "text")
+print(p_spaghetti)
 ```
 
 # Correlation Structure
@@ -466,12 +456,11 @@ cor_long <- cor_matrix %>%
   pivot_longer(-var1, names_to = "var2", values_to = "correlation")
 ```
 
-## Interactive Correlation Heatmap
+## Correlation Heatmap
 
 ```{r correlation-heatmap}
 p_cor <- cor_long %>%
-  ggplot(aes(x = var1, y = var2, fill = correlation,
-             text = paste0(var1, " × ", var2, "\nr = ", round(correlation, 3)))) +
+  ggplot(aes(x = var1, y = var2, fill = correlation)) +
   geom_tile() +
   scale_fill_gradient2(
     low = "#2166ac", mid = "white", high = "#b2182b",
@@ -484,7 +473,7 @@ p_cor <- cor_long %>%
     axis.text.y = element_text(size = 7)
   )
 
-ggplotly(p_cor, tooltip = "text")
+print(p_cor)
 ```
 
 ## Strong Correlations (|r| > 0.7)
@@ -525,8 +514,7 @@ make_by_type <- df %>%
 kable(make_by_type, caption = "Make Rate by Shot Type")
 
 p_make_type <- make_by_type %>%
-  ggplot(aes(x = shot_type, y = make_rate, fill = shot_type,
-             text = paste0(shot_type, "\nMake Rate: ", make_rate, "%\nn = ", n))) +
+  ggplot(aes(x = shot_type, y = make_rate, fill = shot_type)) +
   geom_col(alpha = 0.8) +
   geom_hline(yintercept = overall_make_rate * 100, linetype = "dashed", color = "red") +
   scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
@@ -536,7 +524,7 @@ p_make_type <- make_by_type %>%
   theme_minimal() +
   theme(legend.position = "none")
 
-ggplotly(p_make_type, tooltip = "text")
+print(p_make_type)
 ```
 
 ## Make Rate by Player
@@ -555,10 +543,7 @@ make_by_player <- df %>%
 kable(make_by_player, caption = "Make Rate by Player (Ranked)")
 
 p_make_player <- make_by_player %>%
-  ggplot(aes(x = reorder(player_id, make_rate), y = make_rate,
-             text = paste0("Player: ", player_id,
-                          "\nMake Rate: ", make_rate, "%",
-                          "\nMakes: ", makes, "/", n))) +
+  ggplot(aes(x = reorder(player_id, make_rate), y = make_rate)) +
   geom_col(fill = "steelblue", alpha = 0.8) +
   geom_hline(yintercept = overall_make_rate * 100, linetype = "dashed", color = "red") +
   coord_flip() +
@@ -567,17 +552,14 @@ p_make_player <- make_by_player %>%
        x = "Player ID", y = "Make Rate (%)") +
   theme_minimal()
 
-ggplotly(p_make_player, tooltip = "text")
+print(p_make_player)
 ```
 
 ## Jump Height vs Make Probability
 
 ```{r jump-vs-make, eval=show_made_section && has_jump}
 p_jump_make <- df %>%
-  ggplot(aes(x = .data[[jump_col]], y = made,
-             text = paste0("Player: ", player_id,
-                          "\n", jump_col, ": ", round(.data[[jump_col]], 2),
-                          "\nMade: ", made))) +
+  ggplot(aes(x = .data[[jump_col]], y = made)) +
   geom_jitter(alpha = 0.4, height = 0.1, width = 0, color = "steelblue") +
   geom_smooth(method = "loess", se = TRUE, color = "red", fill = "red", alpha = 0.2) +
   labs(
@@ -588,7 +570,7 @@ p_jump_make <- df %>%
   ) +
   theme_minimal()
 
-ggplotly(p_jump_make, tooltip = "text")
+print(p_jump_make)
 ```
 
 # EDA Takeaways

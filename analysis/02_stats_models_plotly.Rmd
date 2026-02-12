@@ -1,0 +1,1285 @@
+---
+title: "Statistical Models – Force Plate Basketball Shooting Analysis"
+author: "Samuel Montalvo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+knitr::opts_knit$set(root.dir = here::here())
+```
+# Setup and Data Loading
+
+## Load Packages
+
+```{r load-packages}
+# Core
+library(tidyverse)
+library(janitor)
+library(here)
+
+# Mixed models
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+
+# GEE and robust SE
+library(geepack)
+library(sandwich)
+# library(clubSandwich)  # Optional: install if needed for CR standard errors
+
+# Model diagnostics and emmeans
+library(performance)
+library(emmeans)
+
+# Tables and visualization
+library(DT)
+library(plotly)
+library(knitr)
+
+# Set contrasts for proper interpretation
+options(contrasts = c("contr.treatment", "contr.poly"))
+```
+
+## Helper Functions
+
+```{r helper-functions}
+# Function to find columns by keyword patterns
+find_col <- function(cols, patterns, required = FALSE, name = "column") {
+  for (p in patterns) {
+    matches <- cols[str_detect(tolower(cols), tolower(p))]
+    if (length(matches) > 0) return(matches[1])
+  }
+  if (required) {
+    stop(paste("ERROR: Could not find required", name, "column"))
+  }
+  return(NA_character_)
+}
+
+# Helpers for lme4 convergence diagnostics
+get_lme4_messages <- function(mod) {
+  msgs <- mod@optinfo$conv$lme4$messages
+  if (is.null(msgs)) character(0) else as.character(msgs)
+}
+
+is_lme4_converged <- function(messages) {
+  if (length(messages) == 0) return(TRUE)
+  all(str_detect(messages, "boundary \\(singular\\) fit"))
+}
+
+collapse_messages <- function(messages) {
+  if (length(messages) == 0) NA_character_ else paste(unique(messages), collapse = " | ")
+}
+
+# Function to map all columns
+map_columns <- function(df) {
+  cols <- names(df)
+
+  mapping <- tibble(
+    role = c(
+      "player_id", "shot_type", "made", "shot_number",
+      "jump_height", "peak_propulsive_force", "peak_propulsive_power",
+      "peak_braking_force", "peak_braking_power",
+      "braking_duration", "propulsive_duration", "displacement_depth",
+      "position", "height", "body_mass",
+      "left_leg_propulsive", "right_leg_propulsive"
+    ),
+    patterns = list(
+      c("^player_id$", "subject", "athlete", "^pid$"),
+      c("^shot_type$", "shot.*type"),
+      c("^made$", "miss.*made", "result"),
+      c("shot_number", "shot_num", "trial"),
+      c("jump_height", "jump"),
+      c("peak_propulsive_force", "propulsive_force"),
+      c("peak_propulsive_power", "propulsive_power"),
+      c("peak_braking_force", "braking_force"),
+      c("peak_braking_power", "braking_power"),
+      c("braking_duration"),
+      c("propulsive_duration"),
+      c("displacement_depth", "displacement", "depth"),
+      c("^position$", "position_group", "group"),
+      c("^height$", "height_cm"),
+      c("body_mass", "mass", "weight", "bodymass"),
+      c("left.*propulsive"),
+      c("right.*propulsive")
+    )
+  )
+
+  mapping <- mapping %>%
+    rowwise() %>%
+    mutate(
+      detected = find_col(cols, patterns),
+      found = !is.na(detected)
+    ) %>%
+    ungroup()
+
+  return(mapping)
+}
+
+# Function to create QC keep indicator
+make_qc_keep <- function(df, col_map) {
+  # Get column names
+  brake_dur <- col_map %>% filter(role == "braking_duration") %>% pull(detected)
+  prop_dur <- col_map %>% filter(role == "propulsive_duration") %>% pull(detected)
+  disp_depth <- col_map %>% filter(role == "displacement_depth") %>% pull(detected)
+  player_col <- col_map %>% filter(role == "player_id") %>% pull(detected)
+
+  df <- df %>% mutate(qc_keep = TRUE, qc_reason = NA_character_)
+
+  # Duration filters
+ if (!is.na(brake_dur)) {
+    df <- df %>%
+      mutate(
+        qc_keep = ifelse(.data[[brake_dur]] > 0.8, FALSE, qc_keep),
+        qc_reason = ifelse(.data[[brake_dur]] > 0.8 & is.na(qc_reason),
+                          "braking_duration > 0.8", qc_reason)
+      )
+  }
+
+  if (!is.na(prop_dur)) {
+    df <- df %>%
+      mutate(
+        qc_keep = ifelse(.data[[prop_dur]] > 0.8, FALSE, qc_keep),
+        qc_reason = ifelse(.data[[prop_dur]] > 0.8 & is.na(qc_reason),
+                          "propulsive_duration > 0.8", qc_reason)
+      )
+  }
+
+  # Displacement depth outliers
+  if (!is.na(disp_depth)) {
+    # Global IQR outliers
+    q1 <- quantile(df[[disp_depth]], 0.25, na.rm = TRUE)
+    q3 <- quantile(df[[disp_depth]], 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower <- q1 - 1.5 * iqr
+    upper <- q3 + 1.5 * iqr
+
+    df <- df %>%
+      mutate(
+        depth_iqr_outlier = .data[[disp_depth]] < lower | .data[[disp_depth]] > upper
+      )
+
+    # Within-player z-score outliers
+    df <- df %>%
+      group_by(.data[[player_col]]) %>%
+      mutate(
+        n_trials = n(),
+        depth_mean = mean(.data[[disp_depth]], na.rm = TRUE),
+        depth_sd = sd(.data[[disp_depth]], na.rm = TRUE),
+        depth_z = ifelse(depth_sd > 0 & n_trials >= 5,
+                        (.data[[disp_depth]] - depth_mean) / depth_sd, 0),
+        depth_z_outlier = abs(depth_z) > 3 & n_trials >= 5
+      ) %>%
+      ungroup() %>%
+      mutate(
+        qc_keep = ifelse(depth_iqr_outlier | depth_z_outlier, FALSE, qc_keep),
+        qc_reason = ifelse((depth_iqr_outlier | depth_z_outlier) & is.na(qc_reason),
+                          "displacement_depth outlier", qc_reason)
+      ) %>%
+      select(-n_trials, -depth_mean, -depth_sd, -depth_z, -depth_iqr_outlier, -depth_z_outlier)
+  }
+
+  return(df)
+}
+
+# Function to fit LMM set for one outcome
+fit_lmm_set <- function(df, outcome_col, shot_type_col, player_col,
+                        covariates = NULL, data_label = "full") {
+
+  results <- list()
+
+  # Standardize outcome for effect size
+  df <- df %>%
+    mutate(
+      outcome = .data[[outcome_col]],
+      outcome_z = scale(outcome)[,1]
+    )
+
+  # Base model
+  formula_base <- as.formula(paste("outcome ~", shot_type_col, "+ (1|", player_col, ")"))
+
+  results$base <- tryCatch({
+    lmer(formula_base, data = df, REML = TRUE)
+  }, error = function(e) {
+    message("Base model failed for ", outcome_col, ": ", e$message)
+    NULL
+  })
+
+  # Adjusted model (if covariates available)
+  if (!is.null(covariates) && length(covariates) > 0) {
+    cov_string <- paste(covariates, collapse = " + ")
+    formula_adj <- as.formula(paste("outcome ~", shot_type_col, "+", cov_string,
+                                    "+ (1|", player_col, ")"))
+    results$adjusted <- tryCatch({
+      lmer(formula_adj, data = df, REML = TRUE)
+    }, error = function(e) {
+      message("Adjusted model failed for ", outcome_col, ": ", e$message)
+      NULL
+    })
+  }
+
+  # Random slope model
+  formula_rs <- as.formula(paste("outcome ~", shot_type_col,
+                                  "+ (1 +", shot_type_col, "|", player_col, ")"))
+  results$random_slope <- tryCatch({
+    mod <- lmer(formula_rs, data = df, REML = TRUE,
+                control = lmerControl(optimizer = "bobyqa",
+                                     optCtrl = list(maxfun = 2e5)))
+    # Check for singularity
+    if (isSingular(mod)) {
+      message("Random slope model singular for ", outcome_col)
+      attr(mod, "singular") <- TRUE
+    }
+    mod
+  }, error = function(e) {
+    message("Random slope model failed for ", outcome_col, ": ", e$message)
+    NULL
+  })
+
+  # Standardized model for effect size
+  formula_std <- as.formula(paste("outcome_z ~", shot_type_col, "+ (1|", player_col, ")"))
+  results$standardized <- tryCatch({
+    lmer(formula_std, data = df, REML = TRUE)
+  }, error = function(e) NULL)
+
+  attr(results, "outcome") <- outcome_col
+  attr(results, "data_label") <- data_label
+  attr(results, "n") <- nrow(df)
+  attr(results, "sd_outcome") <- sd(df$outcome, na.rm = TRUE)
+
+  return(results)
+}
+
+# Function to extract LMM results
+extract_lmm_results <- function(model_list, outcome_col, data_label) {
+
+  if (is.null(model_list$base)) {
+    return(tibble(
+      outcome = outcome_col,
+      data = data_label,
+      model = "base",
+      term = NA,
+      estimate = NA,
+      std.error = NA,
+      ci_lower = NA,
+      ci_upper = NA,
+      p_value = NA,
+      std_beta = NA,
+      icc = NA,
+      var_player = NA,
+      var_residual = NA,
+      n = attr(model_list, "n"),
+      singular = NA,
+      converged = FALSE,
+      convergence_note = "model fit failed"
+    ))
+  }
+
+  results <- tibble()
+  sd_outcome <- attr(model_list, "sd_outcome")
+
+  for (mod_name in c("base", "adjusted", "random_slope")) {
+    mod <- model_list[[mod_name]]
+    if (is.null(mod)) next
+
+    # Fixed effects
+    fe <- tidy(mod, effects = "fixed", conf.int = TRUE, conf.level = 0.95)
+
+    # Variance components
+    vc <- as.data.frame(VarCorr(mod))
+    var_player <- vc %>% filter(grp != "Residual") %>% pull(vcov) %>% sum()
+    var_residual <- vc %>% filter(grp == "Residual") %>% pull(vcov)
+    icc <- var_player / (var_player + var_residual)
+
+    # Standardized beta from standardized model (for shot_type effect)
+    std_beta <- NA
+    if (!is.null(model_list$standardized) && mod_name == "base") {
+      std_fe <- tidy(model_list$standardized, effects = "fixed")
+      std_row <- std_fe %>% filter(str_detect(term, "shot_type|3PT"))
+      if (nrow(std_row) > 0) {
+        std_beta <- std_row$estimate[1]
+      }
+    }
+
+    # Check singularity
+    is_singular <- isSingular(mod) || isTRUE(attr(mod, "singular"))
+    conv_messages <- get_lme4_messages(mod)
+    did_converge <- is_lme4_converged(conv_messages)
+
+    mod_results <- fe %>%
+      mutate(
+        outcome = outcome_col,
+        data = data_label,
+        model = mod_name,
+        ci_lower = conf.low,
+        ci_upper = conf.high,
+        p_value = p.value,
+        std_beta = ifelse(str_detect(term, "shot_type|3PT"), std_beta, NA),
+        icc = icc,
+        var_player = var_player,
+        var_residual = var_residual,
+        n = attr(model_list, "n"),
+        singular = is_singular,
+        converged = did_converge,
+        convergence_note = collapse_messages(conv_messages)
+      ) %>%
+      select(outcome, data, model, term, estimate, std.error, ci_lower, ci_upper,
+             p_value, std_beta, icc, var_player, var_residual, n, singular, converged,
+             convergence_note)
+
+    results <- bind_rows(results, mod_results)
+  }
+
+  return(results)
+}
+
+# Function to fit success models
+fit_success_models <- function(df, made_col, shot_type_col, player_col,
+                               jump_col, power_col, position_col = NULL,
+                               data_label = "full") {
+
+  results <- list()
+
+  # Standardize predictors
+  df <- df %>%
+    mutate(
+      made = .data[[made_col]],
+      shot_type_f = factor(.data[[shot_type_col]]),
+      jump_z = scale(.data[[jump_col]])[,1],
+      power_z = scale(.data[[power_col]])[,1],
+      player = factor(.data[[player_col]])
+    )
+
+  # Build formula
+  predictors <- "shot_type_f + jump_z + power_z"
+  if (!is.na(position_col) && position_col %in% names(df)) {
+    df <- df %>% mutate(position_f = factor(.data[[position_col]]))
+    predictors <- paste(predictors, "+ position_f")
+  }
+
+  # GEE model
+  gee_formula <- as.formula(paste("made ~", predictors))
+
+  results$gee <- tryCatch({
+    geeglm(gee_formula, data = df, id = player, family = binomial,
+           corstr = "exchangeable")
+  }, error = function(e) {
+    message("GEE model failed: ", e$message)
+    NULL
+  })
+
+  # GLMM model
+  glmm_formula <- as.formula(paste("made ~", predictors, "+ (1|player)"))
+
+  results$glmm <- tryCatch({
+    glmer(glmm_formula, data = df, family = binomial,
+          control = glmerControl(optimizer = "bobyqa",
+                                optCtrl = list(maxfun = 2e5)))
+  }, error = function(e) {
+    message("GLMM model failed: ", e$message)
+    NULL
+  })
+
+  attr(results, "data_label") <- data_label
+  attr(results, "n") <- nrow(df)
+  attr(results, "n_made") <- sum(df$made, na.rm = TRUE)
+
+  return(results)
+}
+
+# Function to extract success model results
+extract_success_results <- function(model_list, data_label) {
+
+  results <- tibble()
+
+  # GEE results
+  if (!is.null(model_list$gee)) {
+    gee_summary <- summary(model_list$gee)
+    gee_coef <- gee_summary$coefficients
+    gee_error_code <- model_list$gee$geese$error
+    gee_converged <- is.null(gee_error_code) || all(gee_error_code == 0)
+    gee_note <- if (gee_converged) {
+      NA_character_
+    } else {
+      paste("geese$error =", paste(gee_error_code, collapse = ","))
+    }
+
+    gee_results <- tibble(
+      model = "GEE",
+      data = data_label,
+      term = rownames(gee_coef),
+      estimate = gee_coef[, "Estimate"],
+      std_error = gee_coef[, "Std.err"],
+      or = exp(gee_coef[, "Estimate"]),
+      or_lower = exp(gee_coef[, "Estimate"] - 1.96 * gee_coef[, "Std.err"]),
+      or_upper = exp(gee_coef[, "Estimate"] + 1.96 * gee_coef[, "Std.err"]),
+      p_value = gee_coef[, "Pr(>|W|)"],
+      n = attr(model_list, "n"),
+      converged = gee_converged,
+      singular = NA,
+      convergence_note = gee_note
+    )
+    results <- bind_rows(results, gee_results)
+  }
+
+  # GLMM results
+  if (!is.null(model_list$glmm)) {
+    glmm_fe <- tidy(model_list$glmm, effects = "fixed", conf.int = TRUE)
+    glmm_messages <- get_lme4_messages(model_list$glmm)
+    glmm_converged <- is_lme4_converged(glmm_messages)
+    glmm_singular <- isSingular(model_list$glmm)
+
+    glmm_results <- glmm_fe %>%
+      mutate(
+        model = "GLMM",
+        data = data_label,
+        or = exp(estimate),
+        or_lower = exp(conf.low),
+        or_upper = exp(conf.high),
+        n = attr(model_list, "n"),
+        converged = glmm_converged,
+        singular = glmm_singular,
+        convergence_note = collapse_messages(glmm_messages)
+      ) %>%
+      select(model, data, term, estimate, std.error, or, or_lower, or_upper, p.value, n,
+             converged, singular, convergence_note) %>%
+      rename(p_value = p.value, std_error = std.error)
+
+    results <- bind_rows(results, glmm_results)
+  }
+
+  return(results)
+}
+```
+
+## Load Data
+
+```{r load-data}
+# File paths
+primary_file <- here("data", "grf_shooting_clean.csv")
+fallback_file <- here("data", "GRF Shooting SM[40].csv")
+
+# Load data
+if (file.exists(primary_file)) {
+  df <- read_csv(primary_file, show_col_types = FALSE)
+  cat("Loaded:", primary_file, "\n")
+} else if (file.exists(fallback_file)) {
+  df <- read_csv(fallback_file, show_col_types = FALSE) %>%
+    janitor::clean_names()
+  cat("Loaded fallback:", fallback_file, "\n")
+} else {
+  stop("No data file found!")
+}
+
+cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+## Column Mapping
+
+```{r column-mapping}
+col_map <- map_columns(df)
+
+# Display mapping
+col_map %>%
+  filter(found) %>%
+  select(role, detected) %>%
+  kable(caption = "Column Mapping: Role -> Detected Column Name")
+```
+
+## Standardize Key Columns
+
+```{r standardize-columns}
+# Get detected column names
+player_col <- col_map %>% filter(role == "player_id") %>% pull(detected)
+shot_type_col <- col_map %>% filter(role == "shot_type") %>% pull(detected)
+made_col <- col_map %>% filter(role == "made") %>% pull(detected)
+
+# Check required columns
+if (is.na(player_col)) stop("player_id column not found!")
+if (is.na(shot_type_col)) stop("shot_type column not found!")
+
+has_made <- !is.na(made_col)
+
+# Standardize player_id
+if (player_col != "player_id") {
+  df <- df %>% rename(player_id = !!sym(player_col))
+  player_col <- "player_id"
+}
+df <- df %>% mutate(player_id = as.character(player_id))
+
+# Standardize shot_type
+if (shot_type_col != "shot_type") {
+  df <- df %>% rename(shot_type = !!sym(shot_type_col))
+  shot_type_col <- "shot_type"
+}
+
+df <- df %>%
+  mutate(
+    shot_type = case_when(
+      shot_type %in% c(2, "2", "2PT", "2pt") ~ "2PT",
+      shot_type %in% c(3, "3", "3PT", "3pt") ~ "3PT",
+      TRUE ~ as.character(shot_type)
+    ),
+    shot_type = factor(shot_type, levels = c("2PT", "3PT"))
+  )
+
+# Standardize made
+if (has_made) {
+  if (made_col != "made") {
+    df <- df %>% rename(made = !!sym(made_col))
+    made_col <- "made"
+  }
+  df <- df %>% mutate(made = as.integer(made))
+}
+
+# Update column map
+col_map <- col_map %>%
+  mutate(detected = case_when(
+    role == "player_id" ~ "player_id",
+    role == "shot_type" ~ "shot_type",
+    role == "made" & has_made ~ "made",
+    TRUE ~ detected
+  ))
+
+cat("\nKey columns standardized:\n")
+cat("- player_id: character\n")
+cat("- shot_type: factor with levels", levels(df$shot_type), "\n")
+if (has_made) cat("- made: integer (0/1)\n")
+```
+
+## Data Summary
+
+```{r data-summary}
+cat("Dataset dimensions:", nrow(df), "rows x", ncol(df), "columns\n\n")
+
+# Trials per player
+trials_player <- df %>%
+  count(player_id, name = "n_trials")
+
+cat("Trials per player:\n")
+print(trials_player)
+
+# By shot type
+cat("\nTrials by shot type:\n")
+trials_shot <- df %>%
+  count(player_id, shot_type) %>%
+  pivot_wider(names_from = shot_type, values_from = n, values_fill = 0)
+print(trials_shot)
+
+# Overall counts
+cat("\nOverall shot type distribution:\n")
+print(table(df$shot_type))
+```
+
+# Quality Control
+
+## Define QC Exclusions
+
+```{r qc-definitions}
+df <- make_qc_keep(df, col_map)
+
+# Summary of exclusions
+qc_summary <- df %>%
+  summarise(
+    total = n(),
+    excluded = sum(!qc_keep),
+    kept = sum(qc_keep),
+    pct_excluded = round(100 * excluded / total, 1)
+  )
+
+cat("QC Summary:\n")
+cat("- Total trials:", qc_summary$total, "\n")
+cat("- Excluded:", qc_summary$excluded, "(", qc_summary$pct_excluded, "%)\n")
+cat("- Kept:", qc_summary$kept, "\n")
+```
+
+```{r qc-by-player}
+qc_by_player <- df %>%
+  group_by(player_id) %>%
+  summarise(
+    n_total = n(),
+    n_excluded = sum(!qc_keep),
+    n_kept = sum(qc_keep),
+    pct_excluded = round(100 * n_excluded / n_total, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_excluded))
+
+cat("\nExclusions by player:\n")
+datatable(qc_by_player, options = list(pageLength = 10))
+```
+
+```{r qc-by-shot-type}
+qc_by_shot <- df %>%
+  group_by(shot_type) %>%
+  summarise(
+    n_total = n(),
+    n_excluded = sum(!qc_keep),
+    pct_excluded = round(100 * n_excluded / n_total, 1),
+    .groups = "drop"
+  )
+
+cat("\nExclusions by shot type:\n")
+print(qc_by_shot)
+```
+
+```{r qc-reasons}
+if (any(!df$qc_keep)) {
+  cat("\nExclusion reasons:\n")
+  print(table(df$qc_reason, useNA = "ifany"))
+}
+```
+
+## Create Analysis Datasets
+
+```{r create-datasets}
+df_full <- df
+df_qc <- df %>% filter(qc_keep)
+
+cat("Full dataset:", nrow(df_full), "observations\n")
+cat("QC dataset:", nrow(df_qc), "observations\n")
+```
+
+# Continuous Outcomes: Linear Mixed Models
+
+## Identify Outcome Columns
+
+```{r identify-outcomes}
+# Map outcome columns
+outcome_roles <- c("jump_height", "peak_propulsive_force", "peak_propulsive_power",
+                   "peak_braking_force", "peak_braking_power",
+                   "braking_duration", "propulsive_duration", "displacement_depth")
+
+outcomes <- col_map %>%
+  filter(role %in% outcome_roles, found) %>%
+  select(role, detected)
+
+cat("Outcome variables identified:\n")
+print(outcomes)
+
+# Primary outcomes
+primary_outcomes <- outcomes %>%
+  filter(role %in% c("jump_height", "peak_propulsive_force", "peak_propulsive_power",
+                     "peak_braking_force", "peak_braking_power")) %>%
+  pull(detected)
+
+# Secondary outcomes (interpret cautiously)
+secondary_outcomes <- outcomes %>%
+  filter(role %in% c("braking_duration", "propulsive_duration", "displacement_depth")) %>%
+  pull(detected)
+
+cat("\nPrimary outcomes:", paste(primary_outcomes, collapse = ", "), "\n")
+cat("Secondary outcomes:", paste(secondary_outcomes, collapse = ", "), "\n")
+```
+
+## Identify Covariates
+
+```{r identify-covariates}
+position_col <- col_map %>% filter(role == "position") %>% pull(detected)
+height_col <- col_map %>% filter(role == "height") %>% pull(detected)
+mass_col <- col_map %>% filter(role == "body_mass") %>% pull(detected)
+
+covariates <- c(position_col, height_col, mass_col)
+covariates <- covariates[!is.na(covariates)]
+
+if (length(covariates) > 0) {
+  cat("Covariates available:", paste(covariates, collapse = ", "), "\n")
+} else {
+  cat("No covariates available for adjusted models\n")
+  covariates <- NULL
+}
+```
+
+## Fit LMMs for All Outcomes
+
+```{r fit-lmms, results='hide'}
+# Store all results
+all_lmm_results <- tibble()
+all_models <- list()
+
+# Function to fit for one dataset
+fit_all_outcomes <- function(data, data_label, outcomes_vec) {
+  results <- tibble()
+  models <- list()
+
+  for (outcome in outcomes_vec) {
+    cat("Fitting models for", outcome, "on", data_label, "data...\n")
+
+    model_set <- fit_lmm_set(
+      df = data,
+      outcome_col = outcome,
+      shot_type_col = "shot_type",
+      player_col = "player_id",
+      covariates = covariates,
+      data_label = data_label
+    )
+
+    models[[outcome]] <- model_set
+
+    extracted <- extract_lmm_results(model_set, outcome, data_label)
+    results <- bind_rows(results, extracted)
+  }
+
+  list(results = results, models = models)
+}
+
+# Fit on full data
+cat("\n=== Fitting models on FULL dataset ===\n")
+full_fit <- fit_all_outcomes(df_full, "full", c(primary_outcomes, secondary_outcomes))
+all_lmm_results <- bind_rows(all_lmm_results, full_fit$results)
+all_models$full <- full_fit$models
+
+# Fit on QC data
+cat("\n=== Fitting models on QC dataset ===\n")
+qc_fit <- fit_all_outcomes(df_qc, "qc", c(primary_outcomes, secondary_outcomes))
+all_lmm_results <- bind_rows(all_lmm_results, qc_fit$results)
+all_models$qc <- qc_fit$models
+```
+
+## LMM Results: Shot Type Effects
+
+```{r lmm-results-table}
+# Filter to shot_type effects only
+shot_type_effects <- all_lmm_results %>%
+  filter(str_detect(term, "shot_type|3PT")) %>%
+  filter(model == "base") %>%
+  select(outcome, data, estimate, std.error, ci_lower, ci_upper, p_value, std_beta, icc, n)
+
+cat("Shot Type (3PT vs 2PT) Effects - Base Models:\n\n")
+datatable(
+  shot_type_effects %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+  caption = "LMM Results: 3PT vs 2PT Effect (Reference = 2PT)",
+  options = list(pageLength = 20, scrollX = TRUE)
+) %>%
+  formatRound(columns = c("estimate", "std.error", "ci_lower", "ci_upper", "std_beta", "icc"), digits = 3) %>%
+  formatSignif(columns = "p_value", digits = 3)
+```
+
+## Comparison: Full vs QC Dataset
+
+```{r compare-full-qc}
+comparison <- shot_type_effects %>%
+  select(outcome, data, estimate, ci_lower, ci_upper, p_value) %>%
+  pivot_wider(
+    names_from = data,
+    values_from = c(estimate, ci_lower, ci_upper, p_value),
+    names_glue = "{data}_{.value}"
+  ) %>%
+  mutate(
+    diff_estimate = full_estimate - qc_estimate,
+    same_direction = sign(full_estimate) == sign(qc_estimate),
+    both_significant = full_p_value < 0.05 & qc_p_value < 0.05
+  )
+
+cat("Comparison of Full vs QC Dataset Results:\n\n")
+datatable(
+  comparison %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+  caption = "Full vs QC Comparison",
+  options = list(scrollX = TRUE)
+)
+```
+
+## Full Results Table (All Models)
+
+```{r full-results-table}
+datatable(
+  all_lmm_results %>%
+    filter(!is.na(term)) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "Complete LMM Results",
+  options = list(pageLength = 20, scrollX = TRUE),
+  filter = "top"
+)
+```
+
+## Model Singularity Check
+
+```{r singularity-check}
+singular_models <- all_lmm_results %>%
+  filter(singular == TRUE) %>%
+  distinct(outcome, data, model)
+
+if (nrow(singular_models) > 0) {
+  cat("Models with singular fit (interpret random effects cautiously):\n")
+  print(singular_models)
+} else {
+  cat("No singular fits detected.\n")
+}
+```
+
+# Binary Outcome: Shot Success Models
+
+```{r shot-success-section, eval=has_made}
+cat("Shot success models will be fitted using the 'made' variable.\n")
+```
+
+## Descriptive: Make Rates {.tabset}
+
+```{r make-rates, eval=has_made}
+# Overall
+overall_rate <- mean(df_full$made, na.rm = TRUE)
+cat("Overall make rate:", round(overall_rate * 100, 1), "%\n\n")
+
+# By shot type
+make_by_type <- df_full %>%
+  group_by(shot_type) %>%
+  summarise(
+    n = n(),
+    makes = sum(made),
+    make_rate = round(mean(made) * 100, 1),
+    .groups = "drop"
+  )
+
+cat("Make rate by shot type:\n")
+print(make_by_type)
+
+# By player
+make_by_player <- df_full %>%
+  group_by(player_id) %>%
+  summarise(
+    n = n(),
+    makes = sum(made),
+    make_rate = round(mean(made) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(make_rate))
+
+cat("\nMake rate by player:\n")
+datatable(make_by_player, options = list(pageLength = 10))
+```
+
+## Fit Success Models
+
+```{r fit-success-models, eval=has_made, results='hide'}
+# Get column names for predictors
+jump_col <- col_map %>% filter(role == "jump_height") %>% pull(detected)
+power_col <- col_map %>% filter(role == "peak_propulsive_power") %>% pull(detected)
+position_col <- col_map %>% filter(role == "position") %>% pull(detected)
+
+all_success_results <- tibble()
+success_models <- list()
+
+# Full data
+cat("Fitting success models on FULL data...\n")
+success_full <- fit_success_models(
+  df = df_full,
+  made_col = "made",
+  shot_type_col = "shot_type",
+  player_col = "player_id",
+  jump_col = jump_col,
+  power_col = power_col,
+  position_col = position_col,
+  data_label = "full"
+)
+success_models$full <- success_full
+all_success_results <- bind_rows(all_success_results,
+                                  extract_success_results(success_full, "full"))
+
+# QC data
+cat("Fitting success models on QC data...\n")
+success_qc <- fit_success_models(
+  df = df_qc,
+  made_col = "made",
+  shot_type_col = "shot_type",
+  player_col = "player_id",
+  jump_col = jump_col,
+  power_col = power_col,
+  position_col = position_col,
+  data_label = "qc"
+)
+success_models$qc <- success_qc
+all_success_results <- bind_rows(all_success_results,
+                                  extract_success_results(success_qc, "qc"))
+```
+
+## Success Model Results
+
+```{r success-results-table, eval=has_made}
+datatable(
+  all_success_results %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3))),
+  caption = "Shot Success Model Results (Odds Ratios)",
+  options = list(pageLength = 20, scrollX = TRUE)
+) %>%
+  formatRound(columns = c("estimate", "std_error", "or", "or_lower", "or_upper"), digits = 3) %>%
+  formatSignif(columns = "p_value", digits = 3)
+```
+
+## Success Model Diagnostics
+
+```{r success-model-diagnostics, eval=has_made}
+success_diagnostics <- all_success_results %>%
+  distinct(model, data, n, converged, singular, convergence_note)
+
+cat("Convergence/Singularity diagnostics for success models:\n")
+print(success_diagnostics)
+```
+
+## Shot Type OR Comparison
+
+```{r shot-type-or, eval=has_made}
+shot_type_or <- all_success_results %>%
+  filter(str_detect(term, "shot_type|3PT")) %>%
+  select(model, data, or, or_lower, or_upper, p_value) %>%
+  mutate(
+    or_ci = paste0(round(or, 2), " [", round(or_lower, 2), ", ", round(or_upper, 2), "]")
+  )
+
+cat("Odds Ratios for 3PT vs 2PT:\n")
+print(shot_type_or)
+```
+
+# Model Diagnostics
+
+## Residual Diagnostics: Jump Height
+
+```{r diagnostics-jump, fig.height=8}
+jump_col <- col_map %>% filter(role == "jump_height") %>% pull(detected)
+
+if (!is.na(jump_col) && !is.null(all_models$full[[jump_col]]$base)) {
+  mod <- all_models$full[[jump_col]]$base
+
+  # Get residuals and fitted values
+  diag_data <- tibble(
+    fitted = fitted(mod),
+    residuals = residuals(mod),
+    std_residuals = residuals(mod, scaled = TRUE)
+  )
+
+  # Residual vs Fitted
+  p1 <- ggplot(diag_data, aes(x = fitted, y = residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    geom_smooth(method = "loess", se = FALSE, color = "blue") +
+    labs(title = paste("Residuals vs Fitted:", jump_col),
+         x = "Fitted Values", y = "Residuals") +
+    theme_minimal()
+
+  # QQ plot
+  p2 <- ggplot(diag_data, aes(sample = std_residuals)) +
+    stat_qq() +
+    stat_qq_line(color = "red") +
+    labs(title = paste("Q-Q Plot:", jump_col),
+         x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal()
+
+  # Combine
+  library(patchwork)
+  combined <- p1 / p2
+  print(combined)
+}
+```
+
+## Residual Diagnostics: Peak Propulsive Power
+
+```{r diagnostics-power, fig.height=8}
+power_col <- col_map %>% filter(role == "peak_propulsive_power") %>% pull(detected)
+
+if (!is.na(power_col) && !is.null(all_models$full[[power_col]]$base)) {
+  mod <- all_models$full[[power_col]]$base
+
+  diag_data <- tibble(
+    fitted = fitted(mod),
+    residuals = residuals(mod),
+    std_residuals = residuals(mod, scaled = TRUE)
+  )
+
+  p1 <- ggplot(diag_data, aes(x = fitted, y = residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    geom_smooth(method = "loess", se = FALSE, color = "blue") +
+    labs(title = paste("Residuals vs Fitted:", power_col),
+         x = "Fitted Values", y = "Residuals") +
+    theme_minimal()
+
+  p2 <- ggplot(diag_data, aes(sample = std_residuals)) +
+    stat_qq() +
+    stat_qq_line(color = "red") +
+    labs(title = paste("Q-Q Plot:", power_col),
+         x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal()
+
+  combined <- p1 / p2
+  print(combined)
+}
+```
+
+## Model Issues Summary
+
+```{r model-issues}
+cat("=== Model Issues Summary ===\n\n")
+
+# Singular fits
+cat("Singular Fits:\n")
+if (nrow(singular_models) > 0) {
+  print(singular_models)
+} else {
+  cat("None\n")
+}
+
+# Convergence issues
+failed_models <- all_lmm_results %>%
+  filter(converged == FALSE) %>%
+  distinct(outcome, data, model, convergence_note)
+
+cat("\nFailed to Converge:\n")
+if (nrow(failed_models) > 0) {
+  print(failed_models)
+} else {
+  cat("None\n")
+}
+```
+
+# Visualization of Model Results
+
+## Estimated Marginal Means: Continuous Outcomes
+
+```{r emmeans-plots}
+emmeans_plots <- list()
+
+for (outcome in primary_outcomes) {
+  if (!is.null(all_models$full[[outcome]]$base)) {
+    mod <- all_models$full[[outcome]]$base
+
+    # Get emmeans
+    emm <- emmeans(mod, ~ shot_type)
+    emm_df <- as.data.frame(emm)
+
+    p <- ggplot(emm_df, aes(x = shot_type, y = emmean, fill = shot_type)) +
+      geom_col(alpha = 0.7, width = 0.6) +
+      geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+      scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
+      labs(
+        title = paste("Estimated Marginal Means:", outcome),
+        subtitle = "Error bars = 95% CI",
+        x = "Shot Type",
+        y = outcome
+      ) +
+      theme_minimal() +
+      theme(legend.position = "none")
+
+    emmeans_plots[[outcome]] <- ggplotly(p)
+  }
+}
+
+# Display plots
+for (outcome in names(emmeans_plots)) {
+  cat("\n###", outcome, "\n\n")
+  print(emmeans_plots[[outcome]])
+}
+```
+
+## Success Model: Predicted Probabilities
+
+```{r success-predictions, eval=has_made}
+if (!is.null(success_models$full$gee)) {
+  # Predict at mean covariates
+  newdata <- expand.grid(
+    shot_type_f = factor(c("2PT", "3PT")),
+    jump_z = 0,
+    power_z = 0
+  )
+
+  # Add position if in model
+  if (!is.na(position_col)) {
+    mode_position <- names(sort(table(df_full[[position_col]]), decreasing = TRUE))[1]
+    newdata$position_f <- factor(mode_position)
+  }
+
+  # Get predictions (GEE)
+  newdata$pred <- predict(success_models$full$gee, newdata = newdata, type = "response")
+
+  p_pred <- ggplot(newdata, aes(x = shot_type_f, y = pred, fill = shot_type_f)) +
+    geom_col(alpha = 0.7, width = 0.6) +
+    scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    labs(
+      title = "Predicted Make Probability by Shot Type",
+      subtitle = "At mean jump height and propulsive power (GEE model)",
+      x = "Shot Type",
+      y = "Predicted Probability"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  ggplotly(p_pred)
+}
+```
+
+```{r success-by-jump, eval=has_made}
+# Probability vs jump height
+if (!is.null(success_models$full$gee)) {
+
+  # Create prediction grid
+  jump_seq <- seq(-2, 2, length.out = 50)
+
+  pred_grid <- expand.grid(
+    shot_type_f = factor(c("2PT", "3PT")),
+    jump_z = jump_seq,
+    power_z = 0
+  )
+
+  if (!is.na(position_col)) {
+    mode_position <- names(sort(table(df_full[[position_col]]), decreasing = TRUE))[1]
+    pred_grid$position_f <- factor(mode_position)
+  }
+
+  pred_grid$pred <- predict(success_models$full$gee, newdata = pred_grid, type = "response")
+
+  p_curve <- ggplot(pred_grid, aes(x = jump_z, y = pred, color = shot_type_f)) +
+    geom_line(linewidth = 1.2) +
+    scale_color_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    labs(
+      title = "Predicted Make Probability vs Jump Height",
+      subtitle = "GEE model, at mean propulsive power",
+      x = "Jump Height (z-score)",
+      y = "Predicted Probability",
+      color = "Shot Type"
+    ) +
+    theme_minimal()
+
+  ggplotly(p_curve)
+}
+```
+
+# Save Results
+
+```{r save-results}
+# Check if results folder exists
+results_dir <- here("results")
+
+if (dir.exists(results_dir)) {
+  # Save LMM results
+  saveRDS(all_lmm_results, file.path(results_dir, "lmm_results.rds"))
+  cat("Saved: results/lmm_results.rds\n")
+
+  # Save success model results
+  if (has_made) {
+    saveRDS(all_success_results, file.path(results_dir, "success_model_results.rds"))
+    cat("Saved: results/success_model_results.rds\n")
+  }
+
+  # Save comparison table
+  saveRDS(comparison, file.path(results_dir, "full_vs_qc_comparison.rds"))
+  cat("Saved: results/full_vs_qc_comparison.rds\n")
+
+} else {
+  cat("results/ folder not found - results kept in memory only\n")
+}
+```
+
+# Key Findings
+
+```{r key-findings, results='asis'}
+cat("## Summary of Key Findings\n\n")
+
+# Extract key effects
+jump_effect <- shot_type_effects %>%
+  filter(str_detect(outcome, "jump"), data == "full")
+
+power_effect <- shot_type_effects %>%
+  filter(str_detect(outcome, "propulsive_power"), data == "full")
+
+force_effect <- shot_type_effects %>%
+  filter(str_detect(outcome, "propulsive_force"), data == "full")
+
+brake_effect <- shot_type_effects %>%
+  filter(str_detect(outcome, "braking_force"), data == "full")
+
+cat("### Continuous Outcomes (3PT vs 2PT)\n\n")
+
+if (nrow(jump_effect) > 0) {
+  dir <- ifelse(jump_effect$estimate[1] > 0, "higher", "lower")
+  sig <- ifelse(jump_effect$p_value[1] < 0.05, "significant", "not significant")
+  cat("- **Jump Height:**", round(jump_effect$estimate[1], 2), "units", dir,
+      "for 3PT (p =", format(jump_effect$p_value[1], digits = 3), ",", sig, ")\n")
+}
+
+if (nrow(power_effect) > 0) {
+  dir <- ifelse(power_effect$estimate[1] > 0, "higher", "lower")
+  sig <- ifelse(power_effect$p_value[1] < 0.05, "significant", "not significant")
+  cat("- **Peak Propulsive Power:**", round(power_effect$estimate[1], 2), "units", dir,
+      "for 3PT (p =", format(power_effect$p_value[1], digits = 3), ",", sig, ")\n")
+}
+
+if (nrow(force_effect) > 0) {
+  dir <- ifelse(force_effect$estimate[1] > 0, "higher", "lower")
+  sig <- ifelse(force_effect$p_value[1] < 0.05, "significant", "not significant")
+  cat("- **Peak Propulsive Force:**", round(force_effect$estimate[1], 2), "units", dir,
+      "for 3PT (p =", format(force_effect$p_value[1], digits = 3), ",", sig, ")\n")
+}
+
+if (nrow(brake_effect) > 0) {
+  dir <- ifelse(brake_effect$estimate[1] > 0, "higher", "lower")
+  sig <- ifelse(brake_effect$p_value[1] < 0.05, "significant", "not significant")
+  cat("- **Peak Braking Force:**", round(brake_effect$estimate[1], 2), "units", dir,
+      "for 3PT (p =", format(brake_effect$p_value[1], digits = 3), ",", sig, ")\n")
+}
+
+if (has_made) {
+  cat("\n### Shot Success\n\n")
+
+  gee_or <- all_success_results %>%
+    filter(model == "GEE", data == "full", str_detect(term, "shot_type|3PT"))
+
+  if (nrow(gee_or) > 0) {
+    cat("- **3PT vs 2PT OR (GEE):**", round(gee_or$or[1], 2),
+        "[", round(gee_or$or_lower[1], 2), ",", round(gee_or$or_upper[1], 2), "]",
+        "(p =", format(gee_or$p_value[1], digits = 3), ")\n")
+  }
+
+  jump_or <- all_success_results %>%
+    filter(model == "GEE", data == "full", str_detect(term, "jump"))
+
+  if (nrow(jump_or) > 0) {
+    cat("- **Jump Height OR (per SD):**", round(jump_or$or[1], 2),
+        "[", round(jump_or$or_lower[1], 2), ",", round(jump_or$or_upper[1], 2), "]\n")
+  }
+}
+
+cat("\n### QC Sensitivity Analysis\n\n")
+
+qc_concordance <- comparison %>%
+  summarise(
+    same_direction = sum(same_direction, na.rm = TRUE),
+    both_sig = sum(both_significant, na.rm = TRUE),
+    total = n()
+  )
+
+cat("- **Direction concordance:** ", qc_concordance$same_direction, "/",
+    qc_concordance$total, " outcomes have same direction in full vs QC data\n", sep = "")
+cat("- **Significance concordance:** ", qc_concordance$both_sig, "/",
+    qc_concordance$total, " outcomes significant in both datasets\n", sep = "")
+
+qc_excluded_pct <- round(100 * (1 - nrow(df_qc) / nrow(df_full)), 1)
+cat("- **QC exclusion rate:**", qc_excluded_pct, "%\n")
+
+if (qc_concordance$same_direction == qc_concordance$total) {
+  cat("- **Conclusion:** QC filtering does NOT materially change conclusions\n")
+} else {
+  cat("- **Conclusion:** Some effects differ between full and QC datasets; interpret with caution\n")
+}
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
