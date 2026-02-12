@@ -33,6 +33,7 @@ library(tidyverse)
 library(janitor)
 library(knitr)
 library(here)
+library(patchwork)  # For combining plots
 
 # Optional packages
 has_naniar <- suppressWarnings(require(naniar, quietly = TRUE))
@@ -363,24 +364,148 @@ for (var in key_vars) {
 }
 ```
 
-## Distributions by Shot Type {.tabset}
+## Publication Figure: Shot Performance and Biomechanics
 
-```{r distributions-by-shot, eval=has_shot_type, results='asis'}
-for (var in key_vars) {
-  cat("\n\n### ", var, "\n\n")
+```{r figure-1-publication, eval=has_shot_type && has_made, fig.height=14, fig.width=12}
+# =============================================================================
+# FIGURE 1: Combined Publication-Ready Figure
+# Panel A: Make Rate by Shot Type
+# Panel B: Force Plate Variables by Shot Type
+# =============================================================================
 
-  p <- df %>%
-    ggplot(aes(x = shot_type, y = .data[[var]], fill = shot_type)) +
-    geom_violin(alpha = 0.5) +
-    geom_boxplot(width = 0.2, alpha = 0.8, outlier.shape = NA) +
-    geom_jitter(width = 0.1, alpha = 0.3, size = 1) +
-    scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
-    labs(title = paste(var, "by Shot Type"), x = "Shot Type", y = var) +
-    theme_minimal() +
-    theme(legend.position = "none")
+# --- Panel A: Make Rate by Shot Type ---
+make_by_type <- df %>%
+  group_by(shot_type) %>%
+  summarise(
+    n = n(),
+    makes = sum(made, na.rm = TRUE),
+    make_rate = mean(made, na.rm = TRUE) * 100,
+    se = sqrt(make_rate * (100 - make_rate) / n),
+    .groups = "drop"
+  )
 
-  print(p)
-}
+overall_make_rate <- mean(df$made, na.rm = TRUE) * 100
+
+p_make_rate <- make_by_type %>%
+  ggplot(aes(x = shot_type, y = make_rate, fill = shot_type)) +
+  geom_col(alpha = 0.85, width = 0.6) +
+  geom_errorbar(aes(ymin = make_rate - 1.96 * se, ymax = make_rate + 1.96 * se),
+                width = 0.15, linewidth = 0.8) +
+  geom_hline(yintercept = overall_make_rate, linetype = "dashed",
+             color = "gray40", linewidth = 0.7) +
+  geom_label(aes(label = paste0(round(make_rate, 1), "%"), y = make_rate + 1.96 * se + 5),
+             size = 5, fontface = "bold", fill = "white", label.size = 0) +
+  scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
+  scale_y_continuous(limits = c(0, 95), breaks = seq(0, 100, 20),
+                     expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    x = "Shot Type",
+    y = "Make Rate (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# --- Panel B: Force Plate Variables by Shot Type ---
+df_long <- df %>%
+  select(player_id, shot_type, all_of(key_vars)) %>%
+  pivot_longer(
+    cols = all_of(key_vars),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    # Clean up variable names and add units
+    variable_label = case_when(
+      str_detect(variable, "jump_height") ~ "Jump Height (cm)",
+      str_detect(variable, "peak_propulsive_force") ~ "Peak Propulsive Force (N)",
+      str_detect(variable, "peak_propulsive_power") ~ "Peak Propulsive Power (W)",
+      str_detect(variable, "peak_braking_force") ~ "Peak Braking Force (N)",
+      str_detect(variable, "peak_braking_power") ~ "Peak Braking Power (W)",
+      str_detect(variable, "body_mass") ~ "Body Mass (kg)",
+      str_detect(variable, "braking_duration") ~ "Braking Duration (s)",
+      str_detect(variable, "propulsive_duration") ~ "Propulsive Duration (s)",
+      str_detect(variable, "displacement_depth") ~ "Displacement Depth (cm)",
+      str_detect(variable, "force_at_min_displacement") ~ "Force at Min Displacement (N)",
+      str_detect(variable, "left_leg.*force") ~ "Left Leg Peak Propulsive Force (N)",
+      str_detect(variable, "right_leg.*force") ~ "Right Leg Peak Propulsive Force (N)",
+      TRUE ~ str_replace_all(variable, "_", " ") %>% str_to_title()
+    )
+  )
+
+p_violins <- df_long %>%
+  ggplot(aes(x = shot_type, y = value, fill = shot_type)) +
+  geom_violin(alpha = 0.5, trim = FALSE, linewidth = 0.3) +
+  geom_boxplot(width = 0.15, alpha = 0.9, outlier.shape = NA, linewidth = 0.4) +
+  scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e"),
+                    labels = c("2PT" = "2-Point", "3PT" = "3-Point")) +
+  facet_wrap(~ variable_label, scales = "free_y", ncol = 3) +
+  labs(
+    x = "Shot Type",
+    y = "Value",
+    fill = "Shot Type"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.background = element_rect(fill = "gray95", color = NA),
+    panel.spacing = unit(0.8, "lines"),
+    axis.text.x = element_text(size = 9),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# --- Combine Panels with patchwork ---
+fig1_combined <- p_make_rate / p_violins +
+  plot_layout(heights = c(1, 3)) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 16)
+    )
+  )
+
+print(fig1_combined)
+
+# --- Save publication-ready figure ---
+fig_dir <- here("figures")
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+ggsave(
+
+  filename = here("figures", "figure1_shot_performance_biomechanics.png"),
+  plot = fig1_combined,
+  width = 12,
+  height = 14,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = here("figures", "figure1_shot_performance_biomechanics.pdf"),
+  plot = fig1_combined,
+  width = 12,
+  height = 14,
+  bg = "white"
+)
+
+cat("\nFigure 1 saved to figures/figure1_shot_performance_biomechanics.png and .pdf\n")
+```
+
+## Distributions by Shot Type (Individual Panels)
+
+```{r distributions-by-shot-individual, eval=has_shot_type, fig.height=12, fig.width=12}
+# Individual view of violin plots for reference
+print(p_violins +
+  labs(title = "Force Plate Variables by Shot Type",
+       subtitle = "Violin plots with embedded boxplots comparing 2PT vs 3PT shots"))
 ```
 
 # Player-Level Variability
@@ -501,30 +626,21 @@ cat("Overall make rate:", round(overall_make_rate * 100, 1), "%\n")
 
 ## Make Rate by Shot Type
 
+*See Figure 1 (Panel A) above for publication-ready visualization.*
+
 ```{r make-rate-shot-type, eval=show_made_section && has_shot_type}
-make_by_type <- df %>%
+# Summary table
+make_by_type_table <- df %>%
   group_by(shot_type) %>%
   summarise(
-    n = n(),
-    makes = sum(made, na.rm = TRUE),
-    make_rate = round(mean(made, na.rm = TRUE) * 100, 1),
+    N = n(),
+    Makes = sum(made, na.rm = TRUE),
+    Misses = N - Makes,
+    `Make Rate (%)` = round(mean(made, na.rm = TRUE) * 100, 1),
     .groups = "drop"
   )
 
-kable(make_by_type, caption = "Make Rate by Shot Type")
-
-p_make_type <- make_by_type %>%
-  ggplot(aes(x = shot_type, y = make_rate, fill = shot_type)) +
-  geom_col(alpha = 0.8) +
-  geom_hline(yintercept = overall_make_rate * 100, linetype = "dashed", color = "red") +
-  scale_fill_manual(values = c("2PT" = "#1f77b4", "3PT" = "#ff7f0e")) +
-  labs(title = "Make Rate by Shot Type",
-       subtitle = paste("Red line = overall (", round(overall_make_rate * 100, 1), "%)"),
-       x = "Shot Type", y = "Make Rate (%)") +
-  theme_minimal() +
-  theme(legend.position = "none")
-
-print(p_make_type)
+kable(make_by_type_table, caption = "Make Rate by Shot Type")
 ```
 
 ## Make Rate by Player
